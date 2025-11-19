@@ -1,0 +1,298 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+title: "Diasorin Analysis"
+output: html_document
+date: "2025-08-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(stats)
+library(RColorBrewer)
+library(ggplot2)
+library(viridis)
+library(hrbrthemes)
+library(tidyverse)
+library(ggpubr)
+library(stats)
+library(lubridate)
+library(reshape2)
+library(pROC)
+library(gtsummary)
+library(readxl)
+library(caret)
+
+#Import Files
+Diasorin_Redcap081425 <- read_excel("~/Diasorin/Diasorin_Redcap081425_script.xlsx")
+demographics <- read_excel("C:/Users/cononye/Desktop/SCRIPT/demographics.xlsx")
+basic_endpoints <- read_excel("C:/Users/cononye/Desktop/SCRIPT/basic_endpoints.xlsx")
+Pt_daily_labs <- read_excel("C:/Users/cononye/Desktop/SCRIPT/Pt_daily_labs.xlsx")
+```
+
+## Select columns from metadata to join with Redcap dataset
+
+```{r, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+
+#Number of samples
+n_distinct(Diasorin_Redcap081425$Sample_ID)
+
+#Number of unique patients
+n_distinct(Diasorin_Redcap081425$Script_study_ID)
+
+#Remove duplicated sample ID (n = 1)
+Diasorin_Redcap081425 <- Diasorin_Redcap081425[!duplicated(Diasorin_Redcap081425$Sample_ID),]
+
+#Remove row that contains sample with different ID name but is from same blood draw as another sample (duplicate aliquot)
+Diasorin_Redcap081425 <- subset(Diasorin_Redcap081425, Sample_ID != "***")
+
+#View table of results
+table(Diasorin_Redcap081425$Sample_result)
+
+#Valid assay result obtained
+assay_result_valid <- subset(Diasorin_Redcap081425, Sample_result == "Equivocal" | Sample_result == "High Bacterial" | Sample_result == "High Viral" | Sample_result == "Moderate Bacterial" | Sample_result == "Moderate Viral")    
+
+#Number of distinct patients with valid memed result
+n_distinct(assay_result_valid$Script_study_ID)
+
+#Combine demographic data, endpoints from fsmresfiles
+data <- basic_endpoints %>% select(patient_ir_id, pt_study_id, discharge_disposition_name, hospital_los_days, total_icu_los_days)
+data2 <- demographics %>% select(case_number, edw_adm_age, bmi, race, gender, ethnicity)
+data_combined <- merge(data, data2, by.x=c("pt_study_id"), by.y=c("case_number"))
+```
+
+## Merge Redcap data with endpoints from resfiles
+
+```{r, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+dataset <- merge(assay_result_valid, data_combined, by.x=c("Script_study_ID"), by.y=c("pt_study_id"))
+dataset$hospital_los_days <- as.numeric(dataset$hospital_los_days)
+dataset$total_icu_los_days <- as.numeric(dataset$total_icu_los_days)
+
+#Group discharge dispositions into fewer categories
+dataset <- dataset %>% mutate(Mortality = case_when(discharge_disposition_name == 'Expired' ~ "Deceased or Hospice", discharge_disposition_name == 'Home' ~ "Home", discharge_disposition_name == 'Acute Inpatient Rehabilitation' ~ "Acute Inpatient Rehabilitation", discharge_disposition_name =='Home or Self Care' ~ "Home", discharge_disposition_name == 'Home with Home Health Care' ~ "Home", discharge_disposition_name == 'Home with Hospice' ~ "Deceased or Hospice", discharge_disposition_name == 'Inpatient Hospice' ~ "Deceased or Hospice", discharge_disposition_name == 'Against Medical Advice (AMA) or Elopement' ~ "Home", discharge_disposition_name == 'Long-Term Acute Care Hospital (LTAC)' ~ "Long-Term Acute Care Hospital (LTAC)", discharge_disposition_name == 'Skilled Nursing Facility or Subacute Rehab Care' ~ "Skilled Nursing Facility or Subacute Rehab Care"))
+
+#Ensure there is a BAL linked to every blood draw within 72 hours of BAL
+dataset <- subset(dataset, BAL_within_72_blooddraw == "Yes")
+```
+
+## Find cases that did not have adjudication done
+```{r}
+#Find number of cases that were adjudicated by group
+table(dataset$Adjudication_Agreement)
+
+#Subset the cases that were not adjudicated and find the etiologies
+No_adjudication <- subset(dataset, Adjudication_Agreement == "Not done")
+table(No_adjudication$Clinical_Impression_Category)
+```
+
+## Cohort Description
+
+```{r, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+list_of_labels <- list(gender="Gender", edw_adm_age="Age on Admission", race="Race", ethnicity="Ethnicity", bmi="Body Mass Index (kg/m2)", hospital_los_days="Hospital Length of Stay, days", total_icu_los_days="Total ICU Length of Stay, days", Mortality="Hospital Discharge Status")
+
+#Remove duplicate patient IDs just for table 1 description
+dataset_for_cohort_description <- dataset[!duplicated(dataset$Script_study_ID),]
+
+#Find number of patients in shock/norepinephrine (the number of NA rows is the number of patients not on norepinephrine)
+data3 <- Pt_daily_labs %>% select(ir_id, day_bucket_starts, norepinephrine_max)
+merged_df <- merge(dataset_for_cohort_description, data3, by.x=c("patient_ir_id", "Sample_collection_date"), by.y=c("ir_id", "day_bucket_starts"))
+sum(is.na(merged_df$norepinephrine_max))
+
+
+#Find descriptive statistics
+dataset_for_cohort_description %>% select(edw_adm_age, gender, bmi, race, ethnicity, hospital_los_days, total_icu_los_days, Mortality) %>% tbl_summary(statistic = list(all_continuous() ~ "{median} ({p25}, {p75})", all_categorical() ~ "{n} ({p}%)"), label=list_of_labels,)
+```
+
+## Change biomarker values to 1/2 lower limit of normal or to maximum
+
+```{r}
+dataset$TRAIL[dataset$TRAIL=="<15"]<-"7.5"
+dataset$IP10[dataset$IP10=="<100"]<-"50"
+dataset$IP10[dataset$IP10==">2000"]<-"2000"
+dataset$CRP[dataset$CRP==">250"]<-"250"
+```
+
+## Confusion Matrix
+
+```{r}
+## Get sens, spec, NPV, PPV, accuracy
+dataset <- dataset %>% mutate(Bacterial_score = case_when(Sample_result == 'High Bacterial' ~ "Bacterial", Sample_result == 'Moderate Bacterial' ~ "Bacterial", Sample_result == 'High Viral' ~ "Viral", Sample_result == 'Moderate Viral' ~ "Viral"))
+
+dataset <- dataset %>% mutate(predicted_values = case_when(Sample_result == 'High Bacterial' ~ "B", Sample_result == 'Moderate Bacterial' ~ "B", Sample_result == 'High Viral' ~ "A", Sample_result == 'Moderate Viral' ~ "A"))
+
+dataset <- dataset %>% mutate(actual_values = case_when(Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection == 'Yes' ~ "B", Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection == 'No' ~ "A"))
+
+actual_values <- factor(c(dataset$actual_values))
+predicted_values <- factor(c(dataset$predicted_values))
+
+confusion_matrix_result <- confusionMatrix(data = predicted_values, reference = actual_values, positive = "B")
+print(confusion_matrix_result)
+
+#To generate a confusion matrix plot
+conf_table <- as.data.frame(table(Actual = dataset$Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection, Predicted = dataset$Bacterial_score))
+matrix <- ggplot(conf_table, aes(x = Predicted, y = Actual, fill = Freq)) + geom_tile() + geom_text(aes(label = Freq), color = "black", size=8) + scale_fill_gradient(low = "white", high = "springgreen4") + labs(title = "BV Score vs Culture or PCR Detection of Bacteria", x = "BV Score (Excluding Equivocal)", y = "Bacterial Infection") + theme_minimal()
+matrix <- matrix + theme(axis.text.x=element_text(size=16), legend.position = "bottom", legend.text = element_text(size=8), axis.text.y = element_text(size=16), plot.title = element_text(hjust = 0.5, face="bold", size=16), axis.title.x = element_text(size=16), axis.title.y = element_text(size=16), legend.title = element_text(size=16))
+print(matrix)
+
+```
+
+## Confusion matrix based on clinical suspicion (defined by adjudication and chart review, includes culture negatives)
+
+```{r}
+#Get sens, spec, NPV, PPV, accuracy for BV score compared to clinical suspicion
+dataset <- dataset %>% mutate(Bacterial_score = case_when(Sample_result == 'High Bacterial' ~ "Bacterial", Sample_result == 'Moderate Bacterial' ~ "Bacterial", Sample_result == 'High Viral' ~ "Viral", Sample_result == 'Moderate Viral' ~ "Viral"))
+
+dataset <- dataset %>% mutate(predicted_values = case_when(Sample_result == 'High Bacterial' ~ "B", Sample_result == 'Moderate Bacterial' ~ "B", Sample_result == 'High Viral' ~ "A", Sample_result == 'Moderate Viral' ~ "A"))
+
+dataset <- dataset %>% mutate(actual_values2 = case_when(Bacterial_Infection_Suspected == 'Yes' ~ "B", Bacterial_Infection_Suspected == 'No' ~ "A"))
+
+actual_values2 <- factor(c(dataset$actual_values2))
+predicted_values <- factor(c(dataset$predicted_values))
+
+confusion_matrix_result <- confusionMatrix(data = predicted_values, reference = actual_values2, positive = "B")
+print(confusion_matrix_result)
+
+#Make confusion matrix comparing BV score to clinical suspicion
+conf_table2 <- as.data.frame(table(Actual = dataset$Bacterial_Infection_Suspected, Predicted = dataset$Bacterial_score))
+
+matrix2 <- ggplot(conf_table2, aes(x = Predicted, y = Actual, fill = Freq)) + geom_tile() + geom_text(aes(label = Freq), color = "black", size=8) + scale_fill_gradient(low = "white", high = "darkcyan") + labs(title = "BV Score vs Confirmed or Suspected Bacterial Infection", x = "BV Score (Excluding Equivocal)", y = "Bacterial Infection") + theme_minimal()
+matrix2 <- matrix2 + theme(axis.text.x=element_text(size=16), legend.position = "bottom", legend.text = element_text(size=8), axis.text.y = element_text(size=16), plot.title = element_text(hjust = 0.5, face="bold", size=16), axis.title.x = element_text(size=16), axis.title.y = element_text(size=16), legend.title = element_text(size=16))
+print(matrix2)
+
+```
+
+## ROC Curves
+
+```{r, message=FALSE, warning=FALSE}
+
+#ROC Curve for BV Score
+df <- dataset
+df$BVScore <- as.numeric(df$BVScore)
+r <- roc(response=df$Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection, predictor=df$BVScore)
+p <- ggroc(r, linewidth=1.2)
+p <- p + ggtitle("Diagnostic Accuracy of BV Score for Differentiating Bacterial and Non-Bacterial Infection") + ylab("Sensitivity") + xlab("Specificity") + geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "grey", linetype = "dashed") + scale_y_continuous(expand = c(0, 0)) + scale_x_reverse(expand = c(0, 0)) + theme_minimal()
+
+#Get area under the curve for BV Score
+auc <- auc(r)
+ci <- ci.auc(r)
+ci_l <- round(ci[1], 2)
+ci_u <- round(ci[3], 2)
+legend_text <- paste0("AUC = ", round(auc, 2), " (95% CI = ", ci_l, " - ", ci_u, ")")
+p <- p + annotate("text", x = 0.3, y = 0.05, label = legend_text, size=5) + theme_minimal()
+roc_curve_bvscore <- p + theme(axis.text.x=element_text(size=16), legend.position = "bottom", legend.text = element_text(size=8), axis.text.y = element_text(size=16), plot.title = element_text(hjust = 0.5, face="bold", size=16), axis.title.x = element_text(size=16), axis.title.y = element_text(size=16), legend.title = element_text(size=16))
+
+#Multiple ROC Curves
+#Subset patients with only procalcitonin values
+procal <- subset(df, !is.na(Procalcitonin))
+procal$Procalcitonin <- as.numeric(procal$Procalcitonin)
+procal <- subset(procal, !is.na(Procalcitonin))
+
+rocobj1 <- roc(procal$Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection, procal$BVScore)
+rocobj2 <- roc(procal$Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection, procal$Procalcitonin)
+
+p <- ggroc(list(BVScore = rocobj1, Procalcitonin = rocobj2), linewidth=1.2) + scale_color_manual(values = c("BVScore" = "blue", "Procalcitonin" = "darkgreen")) + theme_minimal()
+p2 <- p + ggtitle("Diagnostic Accuracy of BV Score for Bacterial Infection (Procalcitonin Subset)") + ylab("Sensitivity") + xlab("Specificity") + geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "grey", linetype = "dashed") + scale_y_continuous(expand = c(0, 0)) + scale_x_reverse(expand = c(0, 0)) + theme(axis.text.x=element_text(size=16), legend.position = "inside", legend.position.inside = c(0.9, 0.8), legend.text = element_text(size=16), axis.text.y = element_text(size=16), plot.title = element_text(hjust = 0.5, face="bold", size=16), axis.title.x = element_text(size=16), axis.title.y = element_text(size=16), legend.title = element_blank())
+  
+auc <- auc(rocobj1)
+ci <- ci.auc(rocobj1)
+ci_l <- round(ci[1], 2)
+ci_u <- round(ci[3], 2)
+legend_text <- paste0("BV Score AUC = ", round(auc, 2), " (95% CI = ", ci_l, " - ", ci_u, ")")
+
+auc2 <- auc(rocobj2)
+ci <- ci.auc(rocobj2)
+ci_l <- round(ci[1], 2)
+ci_u <- round(ci[3], 2)
+legend_text2 <- paste0("Procalcitonin AUC = ", round(auc2, 2), " (95% CI = ", ci_l, " - ", ci_u, ")")
+
+multiple_roc_curves <- p2 + annotate("text", x=0.3, y=0.1, label=legend_text, size=5) + annotate("text", x=0.3, y=0.2, label=legend_text2, size=5)
+
+ggarrange(matrix, matrix2, roc_curve_bvscore, multiple_roc_curves, labels=c("A", "B", "C", "D"), nrow = 2, ncol = 2)
+
+```
+
+## Horizontal stacked barplot of clinical diagnoses and BV Score Categories
+
+```{r, message=FALSE, warning=FALSE}
+
+table(dataset$Clinical_Impression_Category)
+
+dataset$Sample_resu <- as.factor(dataset$Sample_result)
+dataset$Sample_result <- factor(dataset$Sample_result, levels = c("High Bacterial", "Moderate Bacterial", "Equivocal", "Moderate Viral", "High Viral"))
+
+plot1 <- ggplot(dataset, aes(x = fct_rev(fct_infreq(Clinical_Impression_Category)), fill=Sample_result)) + scale_fill_viridis_d() + geom_bar() + labs(title = "Count of Observations per Category", x = "Category",
+y = "Count", fill="BV Result Category") + theme_bw()  + coord_flip()
+p2 <- plot1 + theme(axis.text.x=element_text(size=14), legend.position = "right", legend.text = element_text(size=14), axis.text.y = element_text(size=14), plot.title = element_text(face="bold", hjust = 0.5), axis.title.x = element_text(size=14, face="bold"), axis.title.y = element_text(size=14, face="bold"), legend.title = element_text(size=14))
+```
+
+## Boxplot of Differences Between Bacterial and Non Bacterial Cases
+
+```{r, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+#Create dataframe of variables for faceted boxplot
+boxplot_df <- dataset %>% select(Procalcitonin, Ddimer, Peripheral_WBC, Maximum_temp, TRAIL, IP10, CRP, BVScore, Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection)
+
+#Melt dataframe and remove rows where values were not measured
+df.m <- melt(boxplot_df, id.var = "Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection")
+df.m <- subset(df.m, value != "Not done")
+df.m <- subset(df.m, value != "proca")
+df.m <- subset(df.m, !is.na(value))
+df.m$value <- as.numeric(df.m$value)
+df.m$value<- format(round(df.m$value, 1), nsmall = 1)
+
+#Note total n for each variable since some of this is less than the total, put these numbers in the facet label if it is less than the total cohort size of n=79
+table(df.m$variable)
+
+#Make 'variable' column into a character and re-name rows 
+df.m$variable <- as.character(df.m$variable)
+df.m$variable[df.m$variable=="Ddimer"] <- "D-Dimer (n=21)"
+df.m$variable[df.m$variable=="Peripheral_WBC"] <- "Peripheral Leukocyte Count"
+df.m$variable[df.m$variable=="Maximum_temp"] <- "Maximum Temperature"
+df.m$variable[df.m$variable=="BVScore"] <- "BV Score"
+df.m$variable[df.m$variable=="Procalcitonin"] <- "Procalcitonin (n=40)"
+df.m$variable[df.m$variable=="TRAIL"] <- "TRAIL (n=78)"
+
+#Convert 'value' column back to numeric
+df.m$value <- as.numeric(df.m$value)
+
+#Make faceted boxplot
+p1 <- ggplot(data = df.m, aes(x=Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection, y=log(value))) + geom_boxplot(aes(fill=Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection), outlier.shape = NA) + geom_jitter(width = 0.1) + scale_fill_brewer(palette = "Paired") + labs(x="Culture or PCR Positive Bacterial Infection Within 3 Days of Blood Draw", y="Median Value on Log Scale") + theme_minimal() + facet_wrap( ~ variable, scales="free") + theme(axis.title.x=element_text(size=12, face="bold"), axis.title.y=element_text(size=12, face="bold"), legend.position="none", axis.text.x = element_text(size=12), plot.title = element_text(hjust = 0.5, face="bold"), strip.text.x = element_text(size = 12)) + ggtitle("Clinical Variable and Biomarker Differences Between Bacterial and Non-Bacterial Cases") +  geom_signif(comparisons=list(c("Yes", "No")), map_signif_level = TRUE, step_increase = 0.1, tip_length = 0, textsize = 5) + scale_y_continuous(expand = expansion(mult = c(0, 0.2)))
+
+print(p1)
+
+ggarrange(p2, p1, labels = c("A", "B"),  nrow=1, ncol=2)
+```
+
+## Get statistics for boxplot to perform multiple comparisons
+
+```{r, message=FALSE, warning=FALSE}
+#Procalcitonin is the only significantly difference one, so find numeric values for test, and adjust for multiple comparisons
+
+boxplot_df$Procalcitonin <- as.numeric(boxplot_df$Procalcitonin)
+boxplot_df$Ddimer <- as.numeric(boxplot_df$Ddimer)
+
+kruskal_results <- apply(boxplot_df[, 1:8], 2, function(x) kruskal.test(x = x, g = boxplot_df$Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection))
+
+#P values with adjustment
+p_values <- c(0.0007464, 0.9405, 0.7429, 0.2462, 0.115, 0.2894, 0.2158, 0.3971)
+p_adjusted <- p.adjust(p_values, method = "BH")
+print(p_adjusted)
+
+#get numerical procalcitonin values for each group
+tapply(boxplot_df$Procalcitonin, boxplot_df$Culture_or_PCR_positive_bacterial_infection_within3d_sample_collection, summary)
+
+```
+
+## Find data for patients with no confirmed or suspected bacterial infection
+```{r}
+no_bacterial_infection <- subset(dataset, Bacterial_Infection_Suspected == "No")
+table(no_bacterial_infection$Sample_result)
+```
+
