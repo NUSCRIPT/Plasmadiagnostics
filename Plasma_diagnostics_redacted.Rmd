@@ -296,3 +296,30 @@ no_bacterial_infection <- subset(dataset, Bacterial_Infection_Suspected == "No")
 table(no_bacterial_infection$Sample_result)
 ```
 
+## Compare outcomes based on biomarker values
+```{r, warning=FALSE}
+dataset <- dataset %>% mutate(Mortality_binary = case_when(discharge_disposition_name == 'Expired' ~ "Deceased", discharge_disposition_name == 'Home' ~ "Alive", discharge_disposition_name == 'Acute Inpatient Rehabilitation' ~ "Alive", discharge_disposition_name =='Home or Self Care' ~ "Alive", discharge_disposition_name == 'Home with Home Health Care' ~ "Alive", discharge_disposition_name == 'Home with Hospice' ~ "Alive", discharge_disposition_name == 'Inpatient Hospice' ~ "Alive", discharge_disposition_name == 'Against Medical Advice (AMA) or Elopement' ~ "Alive", discharge_disposition_name == 'Long-Term Acute Care Hospital (LTAC)' ~ "Alive", discharge_disposition_name == 'Skilled Nursing Facility or Subacute Rehab Care' ~ "Alive"))
+
+outcomes_boxplot <- dataset %>% select(TRAIL, IP10, CRP, Mortality_binary)
+
+#Melt dataframe and remove rows where values were not measured
+df.m <- melt(outcomes_boxplot, id.var = "Mortality_binary")
+df.m$value <- as.numeric(df.m$value)
+
+#Make faceted boxplot
+boxplot2 <- ggplot(data = df.m, aes(x=Mortality_binary, y=log(value))) + geom_boxplot(aes(fill=variable), outlier.shape = NA) + geom_jitter(width = 0.1) + scale_fill_brewer(palette = "Paired") + labs(x="Discharge Disposition", y="Median Value on Log Scale") + theme_minimal() + facet_wrap( ~ variable, scales="free") + theme(axis.title.x=element_text(size=12, face="bold"), axis.title.y=element_text(size=12, face="bold"), legend.position="none", axis.text.x = element_text(size=12), plot.title = element_text(hjust = 0.5, face="bold"), strip.text.x = element_text(size = 12)) + ggtitle("Associations Between Biomarkers and Discharge Disposition") +  geom_signif(comparisons=list(c("Deceased", "Alive")), map_signif_level = FALSE, step_increase = 0.1, tip_length = 0, textsize = 5) + scale_y_continuous(expand = expansion(mult = c(0, 0.2)))
+```
+
+## Get median values and statistics for boxplots
+```{r}
+tapply(TRAIL$value, TRAIL$Mortality_binary, summary)
+kruskal.test(value ~ Mortality_binary, data = TRAIL)
+
+tapply(IP10$value, IP10$Mortality_binary, summary)
+kruskal.test(value ~ Mortality_binary, data = IP10)
+
+tapply(CRP$value, CRP$Mortality_binary, summary)
+kruskal.test(value ~ Mortality_binary, data = CRP)
+```
+
+
